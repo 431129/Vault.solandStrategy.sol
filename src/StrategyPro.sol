@@ -3,81 +3,89 @@ pragma solidity ^0.8.20;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
-import "./IMintable.sol";
+import "./MockERC20.sol";
+import "./IStrategy.sol";
 
-contract StrategyPro is Ownable {
+/*
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                          STRATEGYPRO - STRATÉGIE MOCK                         ║
+║                                                                               ║
+║  • Implémente IStrategy → compatible avec VaultPro.sol                        ║
+║  • simulateGain() via mint()                                                  ║
+║  • onlyOwner + onlyVault                                                      ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+*/
+contract StrategyPro is IStrategy, Ownable {
     IERC20 public immutable asset;
-    address public immutable vault; // vault autorisé à interagir
+    address public immutable vault;
+    uint256 public totalInvested;
 
-    uint256 public totalInvested; // capital principal suivi
+    event Invested(uint256 amount, uint256 newTotalInvested);
+    event Withdrawn(uint256 amount, uint256 newTotalInvested);
+    event Harvested(uint256 profit);
+    event GainSimulated(uint256 amount);
 
     constructor(IERC20 _asset, address _vault) Ownable(msg.sender) {
+        require(address(_asset) != address(0), "Invalid asset");
+        require(_vault != address(0), "Invalid vault");
         asset = _asset;
         vault = _vault;
     }
 
-    /// @notice Le vault appelle invest après avoir transféré les fonds
-    function invest(uint256 amount) external {
+    modifier onlyVault() {
         require(msg.sender == vault, "Only vault");
-        // totalInvested reflète le principal que la stratégie doit garder
+        _;
+    }
+
+    // IMPLÉMENTATION IStrategy
+    function invest(uint256 amount) external override onlyVault {
+        require(amount > 0, "Cannot invest 0");
         totalInvested += amount;
+        emit Invested(amount, totalInvested);
     }
 
-    /// @notice Simule un gain pour les tests en "mintant" le token directement
-    /// @dev Nécessite un token mock implémentant IMintable.mint()
-    function simulateGain(uint256 amount) external onlyOwner {
-        IMintable(address(asset)).mint(address(this), amount);
+    function harvest() external override onlyVault returns (uint256 profit) {
+        uint256 currentBal = asset.balanceOf(address(this));
+        if (currentBal <= totalInvested) return 0;
+        profit = currentBal - totalInvested;
+        asset.transfer(vault, profit);
+        emit Harvested(profit);
     }
 
-    /// @notice Harvest : transfère le profit (balance - principal) au vault.
-    /// @return gain montant effectivement transféré (en unités token)
-    function harvest() external returns (uint256 gain) {
-        require(msg.sender == vault, "Only vault");
+    function withdraw(uint256 amount) external override onlyVault {
+        require(amount > 0, "Cannot withdraw 0");
         uint256 bal = asset.balanceOf(address(this));
-        if (bal <= totalInvested) return 0;
-        gain = bal - totalInvested;
+        if (bal == 0) return;
 
-        // transfert du gain au vault
-        asset.transfer(vault, gain);
+        uint256 withdrawn = bal >= amount ? amount : bal;
+        asset.transfer(vault, withdrawn);
 
-        // Ne change pas totalInvested (le principal reste investi)
+        if (withdrawn <= totalInvested) {
+            totalInvested -= withdrawn;
+        } else {
+            totalInvested = 0;
+        }
+
+        emit Withdrawn(withdrawn, totalInvested);
     }
 
-    /// @notice Balance courante (principal + gains non harvestés)
-    function currentBalance() external view returns (uint256) {
-        return asset.balanceOf(address(this));
-    }
-
-    /// @notice Permet de retirer tout (pour tests/emergency)
-    function withdrawAllToVault() external {
-        require(msg.sender == vault, "Only vault");
+    function withdrawAllToVault() external override onlyVault {
         uint256 bal = asset.balanceOf(address(this));
         if (bal > 0) {
             asset.transfer(vault, bal);
+            totalInvested = 0;
+            emit Withdrawn(bal, 0);
         }
-        totalInvested = 0;
     }
 
-/// @notice Withdraw a specific amount of asset back to the vault (partial withdraw)
-/// @dev Caller must be the authorized vault. Strategy should try to free up `amount`
-///      by either using liquid balance or unwinding positions. For our simple mock,
-///      we just transfer what's available up to `amount`.
-function withdraw(uint256 amount) external returns (uint256 withdrawn) {
-    require(msg.sender == vault, "Only vault");
+    function currentBalance() external view override returns (uint256) {
+        return asset.balanceOf(address(this));
+    }
 
-    uint256 bal = asset.balanceOf(address(this));
-    if (bal == 0) return 0;
-
-    // If we have >= amount, transfer exactly amount; otherwise transfer all we have.
-    withdrawn = bal >= amount ? amount : bal;
-
-    // Transfer withdrawn amount to vault
-    asset.transfer(vault, withdrawn);
-
-    // If you track totalInvested/principal, you might need to decrease it if you truly
-    // withdraw principal. For a simple strategy that keeps principal constant, avoid touching totalInvested here.
-    // If withdrawn > 0 and withdrawn <= totalInvested, you may want to reduce totalInvested -= withdrawn;
-    // but in many designs totalInvested represents principal still invested and should be kept consistent.
-}
-
+    // TEST ONLY
+    function simulateGain(uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount > 0");
+        MockERC20(address(asset)).mint(address(this), amount);
+        emit GainSimulated(amount);
+    }
 }
