@@ -217,6 +217,46 @@ contract VaultProTest is Test {
         assertEq(vault.totalAssets(), 0, "Vault empty");
     }
 
+    function testMaxDeposit() public {
+    vault.setDepositCap(500 ether);
+
+    assertEq(vault.maxDeposit(alice), 500 ether, "Cap = 500");
+
+    vm.prank(alice);
+    vault.deposit(300 ether, alice);
+
+    assertEq(vault.maxDeposit(alice), 200 ether, "Cap - 300 = 200");
+    assertEq(vault.maxDeposit(bob), 200 ether, "Same for all");
+}
+
+    function testPreviewWithdraw() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+
+        uint256 shares = vault.previewWithdraw(50 ether);
+        assertEq(shares, 50 ether, "1:1 price");
+
+        uint256 assets = vault.previewDeposit(50 ether);
+        assertEq(assets, 50 ether);
+    }
+
+
+
+
+    function testDepositWithSlippage() public {
+    vm.prank(alice);
+    vault.deposit(100 ether, alice, 99 ether); // minShares = 99
+
+    assertEq(vault.balanceOf(alice), 100 ether);
+    
+    }
+
+    function testDepositSlippageReverts() public {
+        vm.prank(alice);
+        vm.expectRevert("SLIPPAGE");
+        vault.deposit(100 ether, alice, 101 ether); // trop haut
+    } 
+
     /* ═══════════════════════════════════════════════════════════════
        5. TEST D'URGENCE (bonus)
        ═══════════════════════════════════════════════════════════════ */

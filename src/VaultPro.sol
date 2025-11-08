@@ -68,11 +68,21 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     /// @notice État de pause (urgence)
     bool public paused;
 
+    /// PROFIT LOCKING
+    uint256 public lockedProfit; // Profit Verouillé
+    uint256 public lastReport; // Timestamp du dernier harvest
+    uint256 public constant UNLOCK_TIME = 6 hours; // 6h de déverrouillage
+
     /* ═══════════════════════════════════════════════════════════════
        2. EVENTS (pour indexation et frontend)
        ═══════════════════════════════════════════════════════════════ */
-
-    event Harvested(uint256 profit, uint256 loss, uint256 perfFee, uint256 mgmtFee);
+    /// @notice Événement émis lors du harvest
+    /// @param profit Gain total (en assets)
+    /// @param loss Perte (en assets)
+    /// @param perfFee Frais de performance (en assets)
+    /// @param mgmtFee Frais de gestion (en assets)
+    /// @param perfFeeShares Frais de performance (en shares)
+    event Harvested(uint256 indexed profit, uint256 indexed loss, uint256 perfFee, uint256 mgmtFee, uint256 perfFeeShares);
     event StrategyMigrated(address indexed oldStrategy, address indexed newStrategy);
     event FeesUpdated(uint256 perfBps, uint256 mgmtBps);
     event DepositCapUpdated(uint256 newCap);
@@ -80,6 +90,8 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     event DustSwept(uint256 amount);
     event Paused(address account);
     event Unpaused(address account);
+    event ProfitUnlocked(uint256 amount);
+
 
     /* ═══════════════════════════════════════════════════════════════
        3. MODIFICATEURS
@@ -135,10 +147,13 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
         feeRecipient = _feeRecipient;
         performanceFeeBps = _perfBps;
         managementFeeBps = _mgmtBps;
+        
+        
 
         // Initialisation des timestamps
         lastHarvestTimestamp = block.timestamp;
         lastMgmtAccrual = block.timestamp;
+        lastReport = block.timestamp;
     }
 
     /* ═══════════════════════════════════════════════════════════════
@@ -198,6 +213,7 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /// @notice Max dépôt autorisé (ERC-4626)
+    /// Empêcher un dépôt trop gros (ex: TVL cap à 10M$).
     function maxDeposit(address) public view override returns (uint256) {
         return depositCap > 0 ? depositCap - totalAssets() : type(uint256).max;
     }
@@ -210,6 +226,25 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     /// @notice Max redeem possible
     function maxRedeem(address owner) public view override returns (uint256) {
         return balanceOf(owner);
+    }
+
+    
+    // VUE : previewWithdraw
+    // Montrer combien de shares seront brûlés pour retirer X assets
+    // Tu veux retirer 50 USDC
+    // Prix actuel = 1.05 → previewWithdraw(50e6) retourne ~47.62 shares
+    function previewWithdraw(uint256 assets) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return 0;
+        return (assets * supply) / totalAssets();
+    }
+
+    // Vue : previewDeposit (déjà dans ERC4626)
+    // Montrer l’aperçu exact avant transaction
+    // Tu veux déposer 100 USDC
+    // Prix actuel = 1.05 → previewDeposit(100e6) retourne ~95.24 shares
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        return convertToShares(assets);
     }
 
     /* ═══════════════════════════════════════════════════════════════
@@ -235,24 +270,36 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /* ═══════════════════════════════════════════════════════════════
-       9. DÉPÔT (avec auto-invest)
+       9. DÉPÔT (avec auto-invest + PROFIT LOCKING)
        ═══════════════════════════════════════════════════════════════ */
 
     /// @dev Surcharge interne du dépôt
+    /// @notice Déverrouille le profit verrouillé AVANT de mint des shares
+    /// @dev Pourquoi ? → Le prix du share doit refléter le profit déverrouillé
     function _deposit(
         address caller,
         address receiver,
         uint256 assets,
         uint256 shares
     ) internal override whenNotPaused {
-        // Vérification du cap
+        
+        // 1. DÉVERROUILLE LE PROFIT VERROUILLÉ
+        //    → Le prix du share augmente progressivement
+        //    → Évite les sandwich attacks
+        _unlockProfit();
+
+        // 2. VÉRIFICATION DU CAP DE DÉPÔT
         if (depositCap > 0 && totalAssets() + assets > depositCap)
             revert DepositExceedsCap(assets, depositCap);
 
-        // Dépôt standard ERC-4626
+        // 3. ACCRUE LES FRAIS DE GESTION
+        _accrueManagementFee();
+
+        // 4. DÉPÔT STANDARD ERC-4626
+        //    → Mint les shares au prix actuel (incluant profit déverrouillé)
         super._deposit(caller, receiver, assets, shares);
 
-        // AUTO-INVEST IMMÉDIAT
+        // 5. AUTO-INVEST IMMÉDIAT
         if (address(strategy) != address(0)) {
             uint256 idle = IERC20(asset()).balanceOf(address(this));
             if (idle > 0) {
@@ -265,10 +312,12 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /* ═══════════════════════════════════════════════════════════════
-       10. RETRAIT (avec retrait depuis stratégie)
+       10. RETRAIT (avec retrait depuis stratégie + PROFIT LOCKING)
        ═══════════════════════════════════════════════════════════════ */
 
     /// @dev Surcharge interne du retrait
+    /// @notice Déverrouille le profit verrouillé AVANT de burn des shares
+    /// @dev Pourquoi ? → L'utilisateur retire au prix actuel (incluant profit déverrouillé)
     function _withdraw(
         address caller,
         address receiver,
@@ -276,8 +325,16 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
         uint256 assets,
         uint256 shares
     ) internal override nonReentrant whenNotPaused {
+        
+        // 1. DÉVERROUILLE LE PROFIT VERROUILLÉ
+        //    → Le prix du share est mis à jour
+        //    → L'utilisateur ne perd pas de profit
+        _unlockProfit();
+
+        // 2. ACCRUE LES FRAIS DE GESTION
         _accrueManagementFee();
 
+        // 3. VÉRIFIE LA LIQUIDITÉ DANS LE VAULT
         uint256 vaultBal = IERC20(asset()).balanceOf(address(this));
         if (vaultBal < assets && address(strategy) != address(0)) {
             uint256 needed = assets - vaultBal;
@@ -286,6 +343,8 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
             }
         }
 
+        // 4. RETRAIT STANDARD ERC-4626
+        //    → Burn les shares au prix actuel (incluant profit déverrouillé)
         super._withdraw(caller, receiver, owner, assets, shares);
     }
 
@@ -293,53 +352,109 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
        11. HARVEST (récolte des gains)
        ═══════════════════════════════════════════════════════════════ */
 
-    /// @notice Récolte les profits, calcule les frais, gère les pertes
-    /// @dev Profit locking : frais uniquement sur la hausse de NAV
-    function harvest()
-        external
-        nonReentrant
-        whenNotPaused
-        returns (uint256 profit, uint256 loss)
-    {
-        if (address(strategy) == address(0)) revert NoStrategy();
-        _accrueManagementFee();
+/// @notice Récolte les profits, verrouille les gains, mint les frais progressivement
+/// @dev 
+///      1. Déverrouille le profit déjà verrouillé (progressivement sur 6h)
+///      2. Récolte les nouveaux gains
+///      3. Mint les frais de performance IMMÉDIATEMENT
+///      4. Verrouille le RESTE du profit (6h) → anti-sandwich
+/// @return profit Profit total (incluant verrouillé)
+/// @return loss Perte (si assetsAfter < assetsBefore)
+function harvest()
+    external
+    nonReentrant
+    whenNotPaused
+    returns (uint256 profit, uint256 loss)
+{
+    if (address(strategy) == address(0)) revert NoStrategy();
 
-        uint256 assetsBefore = totalAssets();
-        uint256 supply = totalSupply();
-        if (supply == 0) {
-            lastHarvestTimestamp = block.timestamp;
-            return (0, 0);
-        }
+    // 1. DÉVERROUILLE LE PROFIT VERROUILLÉ (progressivement)
+    //    → Appelé à chaque harvest → prix augmente doucement
+    _unlockProfit();
 
-        // Appel à la stratégie
-        try strategy.harvest() returns (uint256 harvestedProfit) {
-            profit = harvestedProfit;
-        } catch {
-            profit = 0;
-        }
+    // 2. ACCRUE LES FRAIS DE GESTION (annualisés)
+    _accrueManagementFee();
 
-        uint256 assetsAfter = totalAssets();
+    // 3. MESURE LES ACTIFS AVANT HARVEST
+    uint256 assetsBefore = totalAssets();
+    uint256 supply = totalSupply();
 
-        // Calcul du profit/perte
-        if (assetsAfter > assetsBefore) {
-            profit = assetsAfter - assetsBefore;
-        } else if (assetsAfter < assetsBefore) {
-            loss = assetsBefore - assetsAfter;
-        }
-
-        // Frais de performance (en shares)
-        uint256 perfFeeShares = 0;
-        if (profit > 0 && performanceFeeBps > 0) {
-            uint256 perfFeeAssets = (profit * performanceFeeBps) / MAX_BPS;
-            uint256 price = (assetsAfter * 1e18) / supply;
-            perfFeeShares = (perfFeeAssets * 1e18) / price;
-            if (perfFeeShares > 0) _mint(feeRecipient, perfFeeShares);
-        }
-
+    if (supply == 0) {
         lastHarvestTimestamp = block.timestamp;
-        emit Harvested(profit, loss, perfFeeShares, 0);
-        return (profit, loss);
+        lastReport = block.timestamp; // ← NOUVEAU : pour profit locking
+        return (0, 0);
     }
+
+    // 4. APPEL À LA STRATÉGIE
+    try strategy.harvest() returns (uint256 harvestedProfit) {
+        profit = harvestedProfit;
+    } catch {
+        profit = 0;
+    }
+
+    // 5. MESURE LES ACTIFS APRÈS HARVEST
+    uint256 assetsAfter = totalAssets();
+
+    // 6. CALCUL DU PROFIT / PERTE RÉEL
+    if (assetsAfter > assetsBefore) {
+        profit = assetsAfter - assetsBefore;
+    } else if (assetsAfter < assetsBefore) {
+        loss = assetsBefore - assetsAfter;
+        profit = 0; // pas de frais sur perte
+    } else {
+        profit = 0;
+    }
+
+    // 7. MINT LES FRAIS DE PERFORMANCE (IMMÉDIATEMENT)
+    uint256 perfFeeAssets = 0;
+    uint256 perfFeeShares = 0;
+    
+    if (profit > 0 && performanceFeeBps > 0) {
+        perfFeeAssets = (profit * performanceFeeBps) / MAX_BPS;
+        uint256 price = (assetsAfter * 1e18) / supply;
+        perfFeeShares = (perfFeeAssets * 1e18) / price;
+
+        if (perfFeeShares > 0) {
+            _mint(feeRecipient, perfFeeShares);
+        }
+
+        // 8. VERROUILLE LE RESTE DU PROFIT (6h)
+        //    → Ce profit sera déverrouillé progressivement
+        uint256 remainingProfit = profit - perfFeeAssets;
+        if (remainingProfit > 0) {
+            lockedProfit += remainingProfit;
+            lastReport = block.timestamp; // ← déclenche le timer
+        }
+    }
+
+    // 9. MET À JOUR LE TIMESTAMP
+    lastHarvestTimestamp = block.timestamp;
+
+    // 10. ÉMET L'ÉVÉNEMENT
+    emit Harvested(profit, loss, perfFeeShares, 0, perfFeeAssets);
+
+    return (profit, loss);
+}
+
+    // ============ PROFIT LOCKING ============
+
+    /// @notice Déverrouille une partie du profit verrouillé 
+    /// @dev Appelé à chaque harvest et avant chaque dépôt/retrait
+    function _unlockProfit() internal {
+        if (lockedProfit == 0) return;
+
+    uint256 elapsed = block.timestamp - lastReport;
+    if (elapsed >= UNLOCK_TIME) {
+        // Tout déverouillé
+        emit ProfitUnlocked(lockedProfit);
+        lockedProfit = 0;
+    } else {
+        uint256 toUnlock = (lockedProfit * elapsed) / UNLOCK_TIME;
+        lockedProfit -= toUnlock;
+        emit ProfitUnlocked(toUnlock);
+
+    }
+}
 
     /* ═══════════════════════════════════════════════════════════════
        12. URGENCE
@@ -393,13 +508,19 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
     /* ═══════════════════════════════════════════════════════════════
        14. HOOKS ERC4626 (public, sans nonReentrant)
        ═══════════════════════════════════════════════════════════════ */
-
-    function deposit(uint256 assets, address receiver)
+    
+    /// @notice Dépôt avec protection contre le slippage
+    /// @param assets Montant à déposer
+    /// @param receiver Destinataire des shares
+    /// @param minShares Minimum de shares à recevoir
+    function deposit(uint256 assets, address receiver, uint256 minShares)
         public
-        override
         whenNotPaused
-        returns (uint256)
+        returns (uint256 shares)
     {
+        shares = previewDeposit(assets);
+        require(shares >= minShares, "SLIPPAGE");
+
         _accrueManagementFee();
         return super.deposit(assets, receiver);
     }
@@ -413,13 +534,17 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
         _accrueManagementFee();
         return super.mint(shares, receiver);
     }
-
-    function withdraw(uint256 assets, address receiver, address owner)
+    /// @notice Retrait avec max loss
+    function withdraw(uint256 assets, address receiver, address owner, uint256 maxLossBps)
         public
-        override
+        //override
         whenNotPaused
-        returns (uint256)
+        returns (uint256 shares)
     {
+        shares = previewWithdraw(assets);
+        uint256 expected = convertToShares(assets);
+        require(expected <= shares + (shares * maxLossBps / 10_000), "Loss too hight");
+
         return super.withdraw(assets, receiver, owner);
     }
 
