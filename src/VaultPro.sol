@@ -204,13 +204,54 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
        7. FONCTIONS DE VUE (ERC-4626 + extensions)
        ═══════════════════════════════════════════════════════════════ */
 
-    /// @notice Total des actifs sous gestion
-    /// @dev Vault + stratégie
-    function totalAssets() public view override returns (uint256) {
-        return
-            IERC20(asset()).balanceOf(address(this)) +
-            (address(strategy) != address(0) ? strategy.currentBalance() : 0);
-    }
+/// @notice Total des actifs sous gestion (hors profit verrouillé)
+/// @dev FORMULE : Vault + Stratégie - Profit Verrouillé
+///      
+///      POURQUOI DÉDUIRE lockedProfit ?
+///      ─────────────────────────────────────────────────────────────
+///      Le profit verrouillé est PHYSIQUEMENT présent dans le vault/stratégie,
+///      MAIS il n'est pas encore "comptabilisé" pour le prix du share.
+///      
+///      EXEMPLE SANS DÉDUCTION (❌ INCORRECT) :
+///      - Vault : 0 USDC
+///      - Stratégie : 200 USDC (100 investis + 100 gains fraîchement récoltés)
+///      - totalAssets() = 0 + 200 = 200 USDC
+///      - Au prochain harvest : assetsBefore = 200, assetsAfter = 200
+///      - Profit détecté = 0 USDC ❌ (alors qu'il y a 100 USDC de gains !)
+///      
+///      EXEMPLE AVEC DÉDUCTION (✅ CORRECT) :
+///      - Vault : 0 USDC
+///      - Stratégie : 200 USDC
+///      - lockedProfit : 100 USDC
+///      - totalAssets() = 0 + 200 - 100 = 100 USDC
+///      - Au prochain harvest après gain de 50 USDC :
+///        * assetsBefore = 100 USDC
+///        * assetsAfter = 150 USDC (après déverrouillage partiel)
+///        * Profit détecté = 50 USDC ✅
+///      
+///      LE DÉVERROUILLAGE PROGRESSIF :
+///      ─────────────────────────────────────────────────────────────
+///      - À chaque appel (deposit/withdraw/harvest), _unlockProfit() est appelé
+///      - lockedProfit diminue linéairement sur 6h
+///      - Le prix du share augmente progressivement
+///      - Anti-sandwich : impossible de déposer → harvest → retirer instantanément
+///      
+/// @return Actifs totaux utilisables pour le calcul du prix du share
+function totalAssets() public view override returns (uint256) {
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 1 : CALCUL DES ACTIFS BRUTS (physiquement présents)
+    // ═══════════════════════════════════════════════════════════════
+    uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
+        (address(strategy) != address(0) ? strategy.currentBalance() : 0);
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 2 : DÉDUCTION DU PROFIT VERROUILLÉ
+    // ═══════════════════════════════════════════════════════════════
+    // → Le profit verrouillé n'est pas encore "réalisé" pour le prix
+    // → Il sera progressivement ajouté sur 6h via _unlockProfit()
+    // → Sécurité : si lockedProfit > totalRaw (bug), on retourne 0
+    return totalRaw > lockedProfit ? totalRaw - lockedProfit : 0;
+}
 
     /// @notice Max dépôt autorisé (ERC-4626)
     /// Empêcher un dépôt trop gros (ex: TVL cap à 10M$).
@@ -352,14 +393,16 @@ contract VaultPro is ERC4626, Ownable, ReentrancyGuard {
        11. HARVEST (récolte des gains)
        ═══════════════════════════════════════════════════════════════ */
 
-/// @notice Récolte les profits, verrouille les gains, mint les frais progressivement
-/// @dev 
-///      1. Déverrouille le profit déjà verrouillé (progressivement sur 6h)
-///      2. Récolte les nouveaux gains
-///      3. Mint les frais de performance IMMÉDIATEMENT
-///      4. Verrouille le RESTE du profit (6h) → anti-sandwich
-/// @return profit Profit total (incluant verrouillé)
-/// @return loss Perte (si assetsAfter < assetsBefore)
+/// @notice Récolte les profits, calcule les frais, et verrouille les gains progressivement
+/// @dev ARCHITECTURE DU PROFIT LOCKING :
+///      1. On déverrouille l'ancien profit (6h de délai)
+///      2. On mesure les actifs AVANT harvest (hors profit verrouillé grâce à totalAssets())
+///      3. La stratégie rapatrie ses gains → assetsAfter augmente
+///      4. On mint les frais de performance IMMÉDIATEMENT (liquides)
+///      5. On verrouille le RESTE du profit sur 6h (anti-sandwich)
+/// @return profit Profit total récolté (avant frais)
+/// @return loss Perte éventuelle (si stratégie a perdu de l'argent)
+/// @notice Récolte les profits, calcule les frais, et verrouille les gains progressivement
 function harvest()
     external
     nonReentrant
@@ -368,44 +411,65 @@ function harvest()
 {
     if (address(strategy) == address(0)) revert NoStrategy();
 
-    // 1. DÉVERROUILLE LE PROFIT VERROUILLÉ (progressivement)
-    //    → Appelé à chaque harvest → prix augmente doucement
+    // ═══════════════════════════════════════════════════════════════
+    // 1. DÉVERROUILLE LE PROFIT VERROUILLÉ
+    // ═══════════════════════════════════════════════════════════════
     _unlockProfit();
 
-    // 2. ACCRUE LES FRAIS DE GESTION (annualisés)
-    _accrueManagementFee();
-
-    // 3. MESURE LES ACTIFS AVANT HARVEST
-    uint256 assetsBefore = totalAssets();
+    // ═══════════════════════════════════════════════════════════════
+    // 2. MESURE DES ACTIFS BRUTS AVANT HARVEST
+    // ═══════════════════════════════════════════════════════════════
+    // IMPORTANT : On mesure vault + stratégie - lockedProfit
+    // On NE DOIT PAS utiliser totalAssets() ici car il déduit déjà lockedProfit
+    // et on veut un calcul explicite pour détecter les nouveaux gains
+    uint256 vaultBalBefore = IERC20(asset()).balanceOf(address(this));
+    uint256 stratBalBefore = address(strategy) != address(0) ? strategy.currentBalance() : 0;
+    uint256 assetsBefore = vaultBalBefore + stratBalBefore - lockedProfit;
+    
     uint256 supply = totalSupply();
 
     if (supply == 0) {
         lastHarvestTimestamp = block.timestamp;
-        lastReport = block.timestamp; // ← NOUVEAU : pour profit locking
+        lastReport = block.timestamp;
         return (0, 0);
     }
 
-    // 4. APPEL À LA STRATÉGIE
+    // ═══════════════════════════════════════════════════════════════
+    // 3. ACCRUE LES FRAIS DE GESTION
+    // ═══════════════════════════════════════════════════════════════
+    _accrueManagementFee();
+
+    // ═══════════════════════════════════════════════════════════════
+    // 4. APPEL À LA STRATÉGIE (récolte des gains)
+    // ═══════════════════════════════════════════════════════════════
     try strategy.harvest() returns (uint256 harvestedProfit) {
-        profit = harvestedProfit;
+        // On ignore la valeur retournée et on recalcule après
     } catch {
-        profit = 0;
+        // La stratégie a échoué, on continue quand même
     }
 
-    // 5. MESURE LES ACTIFS APRÈS HARVEST
-    uint256 assetsAfter = totalAssets();
+    // ═══════════════════════════════════════════════════════════════
+    // 5. MESURE DES ACTIFS BRUTS APRÈS HARVEST
+    // ═══════════════════════════════════════════════════════════════
+    uint256 vaultBalAfter = IERC20(asset()).balanceOf(address(this));
+    uint256 stratBalAfter = address(strategy) != address(0) ? strategy.currentBalance() : 0;
+    uint256 assetsAfter = vaultBalAfter + stratBalAfter - lockedProfit;
 
+    // ═══════════════════════════════════════════════════════════════
     // 6. CALCUL DU PROFIT / PERTE RÉEL
+    // ═══════════════════════════════════════════════════════════════
     if (assetsAfter > assetsBefore) {
         profit = assetsAfter - assetsBefore;
     } else if (assetsAfter < assetsBefore) {
         loss = assetsBefore - assetsAfter;
-        profit = 0; // pas de frais sur perte
+        profit = 0;
     } else {
         profit = 0;
     }
 
-    // 7. MINT LES FRAIS DE PERFORMANCE (IMMÉDIATEMENT)
+    // ═══════════════════════════════════════════════════════════════
+    // 7. MINT DES FRAIS DE PERFORMANCE
+    // ═══════════════════════════════════════════════════════════════
     uint256 perfFeeAssets = 0;
     uint256 perfFeeShares = 0;
     
@@ -418,43 +482,80 @@ function harvest()
             _mint(feeRecipient, perfFeeShares);
         }
 
-        // 8. VERROUILLE LE RESTE DU PROFIT (6h)
-        //    → Ce profit sera déverrouillé progressivement
+        // Verrouille le reste du profit (6h)
         uint256 remainingProfit = profit - perfFeeAssets;
         if (remainingProfit > 0) {
             lockedProfit += remainingProfit;
-            lastReport = block.timestamp; // ← déclenche le timer
+            lastReport = block.timestamp;
         }
     }
 
-    // 9. MET À JOUR LE TIMESTAMP
+    // ═══════════════════════════════════════════════════════════════
+    // 8. MET À JOUR LE TIMESTAMP
+    // ═══════════════════════════════════════════════════════════════
     lastHarvestTimestamp = block.timestamp;
 
-    // 10. ÉMET L'ÉVÉNEMENT
+    // ═══════════════════════════════════════════════════════════════
+    // 9. ÉMET L'ÉVÉNEMENT
+    // ═══════════════════════════════════════════════════════════════
     emit Harvested(profit, loss, perfFeeShares, 0, perfFeeAssets);
 
     return (profit, loss);
 }
 
-    // ============ PROFIT LOCKING ============
+/* ═══════════════════════════════════════════════════════════════
+       12. PROFIT LOCKING - DÉVERROUILLAGE PROGRESSIF
+       ═══════════════════════════════════════════════════════════════ */
 
-    /// @notice Déverrouille une partie du profit verrouillé 
-    /// @dev Appelé à chaque harvest et avant chaque dépôt/retrait
+    /// @notice Déverrouille progressivement le profit verrouillé sur 6 heures
+    /// @dev Appelé automatiquement avant chaque harvest, deposit et withdraw
+    ///      
+    ///      FONCTIONNEMENT :
+    ///      ─────────────────────────────────────────────────────────────
+    ///      Après un harvest, le profit (moins les frais) est verrouillé.
+    ///      À chaque appel de cette fonction, une portion proportionnelle
+    ///      au temps écoulé est déverrouillée.
+    ///      
+    ///      EXEMPLE :
+    ///      - T=0    : lockedProfit = 98 USDC (après harvest de 100 - 2% frais)
+    ///      - T=3h   : déverrouillé = 49 USDC (50% du temps)
+    ///      - T=6h   : déverrouillé = 98 USDC (100%)
+    ///      
+    ///      POURQUOI ?
+    ///      ─────────────────────────────────────────────────────────────
+    ///      Protection anti-sandwich :
+    ///      - Sans profit locking : bot dépose juste avant harvest → retire après → vol de profit
+    ///      - Avec profit locking : le prix du share augmente progressivement sur 6h
+    ///      
     function _unlockProfit() internal {
+        // Si aucun profit verrouillé, on sort immédiatement
         if (lockedProfit == 0) return;
 
-    uint256 elapsed = block.timestamp - lastReport;
-    if (elapsed >= UNLOCK_TIME) {
-        // Tout déverouillé
-        emit ProfitUnlocked(lockedProfit);
-        lockedProfit = 0;
-    } else {
-        uint256 toUnlock = (lockedProfit * elapsed) / UNLOCK_TIME;
-        lockedProfit -= toUnlock;
-        emit ProfitUnlocked(toUnlock);
-
+        // Temps écoulé depuis le dernier harvest
+        uint256 elapsed = block.timestamp - lastReport;
+        
+        if (elapsed >= UNLOCK_TIME) {
+            // ═══════════════════════════════════════════════════════════
+            // CAS 1 : Plus de 6h se sont écoulées → tout déverrouiller
+            // ═══════════════════════════════════════════════════════════
+            emit ProfitUnlocked(lockedProfit);
+            lockedProfit = 0;
+        } else {
+            // ═══════════════════════════════════════════════════════════
+            // CAS 2 : Moins de 6h → déverrouillage proportionnel
+            // ═══════════════════════════════════════════════════════════
+            // Formule : toUnlock = lockedProfit × (elapsed / UNLOCK_TIME)
+            // 
+            // Exemple après 3h (50% du temps) :
+            // toUnlock = 98 USDC × (3h / 6h) = 49 USDC
+            uint256 toUnlock = (lockedProfit * elapsed) / UNLOCK_TIME;
+            
+            if (toUnlock > 0) {
+                lockedProfit -= toUnlock;
+                emit ProfitUnlocked(toUnlock);
+            }
+        }
     }
-}
 
     /* ═══════════════════════════════════════════════════════════════
        12. URGENCE

@@ -240,6 +240,8 @@ contract VaultProTest is Test {
         assertEq(assets, 50 ether);
     }
 
+    
+
 
 
 
@@ -256,6 +258,25 @@ contract VaultProTest is Test {
         vm.expectRevert("SLIPPAGE");
         vault.deposit(100 ether, alice, 101 ether); // trop haut
     } 
+
+function testHarvestMintsFees() public {
+    vm.prank(alice);
+    vault.deposit(100 ether, alice);
+
+    vm.warp(block.timestamp + 1 days);
+    strategy.simulateGain(100 ether);
+
+    uint256 totalAssetsBefore = vault.totalAssets();
+    uint256 feeSharesBefore = vault.balanceOf(feeRecipient);
+    
+    vault.harvest();
+
+    // Le système fonctionne : vérifions que des frais ont été mintés
+    assertGt(vault.balanceOf(feeRecipient), feeSharesBefore, "Fees were minted");
+    
+    // Et que le total des assets a augmenté (même si le profit est verrouillé)
+    assertGt(vault.totalAssets(), totalAssetsBefore, "Total assets increased");
+}
 
     /* ═══════════════════════════════════════════════════════════════
        5. TEST D'URGENCE (bonus)
