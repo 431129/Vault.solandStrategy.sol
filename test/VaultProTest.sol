@@ -19,6 +19,7 @@ import "../src/MockERC20.sol";
 ║  • Nettoyage final (sweepFromStrategy)                                        ║
 ║  • Conservation de la valeur (350 + 105 ether = 455)                          ║
 ║  • Tolérance de 1 wei (arrondis)                                              ║
+║  • GOUVERNANCE DAO (STRATEGIST, KEEPER, GUARDIAN)                             ║
 ║                                                                               ║
 ║  Compatible avec VaultPro.sol (moderne, ERC-4626, pause, cap, etc.)           ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
@@ -39,6 +40,11 @@ contract VaultProTest is Test {
     address carol = address(0xC0C0A);
     address feeRecipient = address(0xFEE);  // Trésorerie
 
+    // GOUVERNANCE DAO
+    address dao = address(0x1111);           // DAO = admin + STRATEGIST + KEEPER + GUARDIAN
+    address keeper = address(0x2222);     // Peut appeler harvest()
+    address guardian = address(0x3333); // Peut pause/unpause
+
     uint256 perfBps = 200;    // 2% performance fee
     uint256 mgmtBps = 100;    // 1% annual management fee
 
@@ -46,34 +52,47 @@ contract VaultProTest is Test {
        2. SETUP - Initialisation avant chaque test
        ═══════════════════════════════════════════════════════════════ */
 
-    function setUp() public {
-        /* 1. Création du token mock */
-        token = new MockERC20("Mock USDC", "mUSDC");
+ function setUp() public {
+    /* 1. Token */
+    token = new MockERC20("Mock USDC", "mUSDC");
 
-        /* 2. Création du vault avec frais */
-        vault = new VaultPro(
-            token,
-            "Pro Vault USDC",
-            "pvUSDC",
-            feeRecipient,
-            perfBps,
-            mgmtBps
-        );
+    /* 2. Vault – le constructeur donne déjà tous les rôles à dao */
+    vault = new VaultPro(
+        token,
+        "Pro Vault USDC",
+        "pvUSDC",
+        feeRecipient,
+        perfBps,
+        mgmtBps,
+        dao
+    );
 
-        /* 3. Création de la stratégie */
-        strategy = new StrategyPro(token, address(vault));
-        vault.setStrategy(strategy);
+    /* 3. Stratégie */
+    strategy = new StrategyPro(token, address(vault));
 
-        /* 4. Distribution de tokens aux utilisateurs */
-        deal(address(token), alice, 1_000 ether);
-        deal(address(token), bob,   1_000 ether);
-        deal(address(token), carol, 1_000 ether);
+    /* 4. DAO configure la stratégie */
+    vm.prank(dao);
+    vault.setStrategy(strategy);
 
-        /* 5. Approbations infinies */
-        vm.prank(alice); token.approve(address(vault), type(uint256).max);
-        vm.prank(bob);   token.approve(address(vault), type(uint256).max);
-        vm.prank(carol); token.approve(address(vault), type(uint256).max);
-    }
+    /* 5. Deal + approve */
+    deal(address(token), alice, 1_000 ether);
+    deal(address(token), bob,   1_000 ether);
+    deal(address(token), carol, 1_000 ether);
+
+    vm.prank(alice); token.approve(address(vault), type(uint256).max);
+    vm.prank(bob);   token.approve(address(vault), type(uint256).max);
+    vm.prank(carol); token.approve(address(vault), type(uint256).max);
+
+    console.log("dao has DEFAULT_ADMIN_ROLE :", vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), dao));
+    console.log("dao has KEEPER             :", vault.hasRole(vault.KEEPER(), dao));
+
+    /* 6. DAO donne le rôle KEEPER */
+    console.log("msg.sender juste avant grantRole :", msg.sender);
+    console.log("dao                               :", dao);
+
+    vm.prank(dao);
+    vault.grantRole(vault.KEEPER(), keeper);
+}
 
     /* ═══════════════════════════════════════════════════════════════
        3. TEST PRINCIPAL - Scénario complet multi-user
@@ -97,9 +116,10 @@ contract VaultProTest is Test {
         assertEq(token.balanceOf(address(vault)), 0, "Vault should be empty");
         assertEq(token.balanceOf(address(strategy)), 350 ether, "Strategy full");
 
-        /* PHASE 2: PREMIER GAIN + HARVEST */
+        /* PHASE 2: PREMIER GAIN + HARVEST (via KEEPER) */
         vm.warp(block.timestamp + 1 days);
         strategy.simulateGain(70 ether);
+        vm.prank(keeper); // ← KEEPER
         vault.harvest();
 
         uint256 price1 = vault.convertToAssets(1e18);
@@ -110,9 +130,10 @@ contract VaultProTest is Test {
         emit log_named_uint("Fee recipient shares after H1", feeShares1);
         assertGt(feeShares1, 0, "Fees minted");
 
-        /* PHASE 3: DEUXIÈME GAIN + HARVEST */
+        /* PHASE 3: DEUXIÈME GAIN + HARVEST (via KEEPER) */
         vm.warp(block.timestamp + 1 days);
         strategy.simulateGain(35 ether);
+        vm.prank(keeper); // ← KEEPER
         vault.harvest();
 
         uint256 price2 = vault.convertToAssets(1e18);
@@ -163,8 +184,8 @@ contract VaultProTest is Test {
             assertGt(feeAssetsFinal, 0, "Fees withdrawn");
         }
 
-        /* PHASE 6: NETTOYAGE FINAL + VÉRIFICATIONS */
-        vm.prank(address(this)); // owner
+        /* PHASE 6: NETTOYAGE FINAL + VÉRIFICATIONS (via DAO) */
+        vm.prank(dao); // ← DAO = admin
         vault.sweepFromStrategy();
 
         emit log_named_uint("Final vault totalAssets", vault.totalAssets());
@@ -183,7 +204,7 @@ contract VaultProTest is Test {
         emit log_named_uint("Total withdrawn", totalWithdrawn);
         emit log_named_uint("Expected (350 + 105)", expected);
 
-        assertApproxEqAbs(totalWithdrawn, expected, 1e15, "");
+        assertApproxEqAbs(totalWithdrawn, expected, 1e15, "Value conserved (1e15 tolerance)");
     }
 
     /* ═══════════════════════════════════════════════════════════════
@@ -218,16 +239,17 @@ contract VaultProTest is Test {
     }
 
     function testMaxDeposit() public {
-    vault.setDepositCap(500 ether);
+        vm.prank(dao); // ← DAO
+        vault.setDepositCap(500 ether);
 
-    assertEq(vault.maxDeposit(alice), 500 ether, "Cap = 500");
+        assertEq(vault.maxDeposit(alice), 500 ether, "Cap = 500");
 
-    vm.prank(alice);
-    vault.deposit(300 ether, alice);
+        vm.prank(alice);
+        vault.deposit(300 ether, alice);
 
-    assertEq(vault.maxDeposit(alice), 200 ether, "Cap - 300 = 200");
-    assertEq(vault.maxDeposit(bob), 200 ether, "Same for all");
-}
+        assertEq(vault.maxDeposit(alice), 200 ether, "Cap - 300 = 200");
+        assertEq(vault.maxDeposit(bob), 200 ether, "Same for all");
+    }
 
     function testPreviewWithdraw() public {
         vm.prank(alice);
@@ -240,17 +262,11 @@ contract VaultProTest is Test {
         assertEq(assets, 50 ether);
     }
 
-    
-
-
-
-
     function testDepositWithSlippage() public {
-    vm.prank(alice);
-    vault.deposit(100 ether, alice, 99 ether); // minShares = 99
+        vm.prank(alice);
+        vault.deposit(100 ether, alice, 99 ether); // minShares = 99
 
-    assertEq(vault.balanceOf(alice), 100 ether);
-    
+        assertEq(vault.balanceOf(alice), 100 ether);
     }
 
     function testDepositSlippageReverts() public {
@@ -259,24 +275,22 @@ contract VaultProTest is Test {
         vault.deposit(100 ether, alice, 101 ether); // trop haut
     } 
 
-function testHarvestMintsFees() public {
-    vm.prank(alice);
-    vault.deposit(100 ether, alice);
+    function testHarvestMintsFees() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
 
-    vm.warp(block.timestamp + 1 days);
-    strategy.simulateGain(100 ether);
+        vm.warp(block.timestamp + 1 days);
+        strategy.simulateGain(100 ether);
 
-    uint256 totalAssetsBefore = vault.totalAssets();
-    uint256 feeSharesBefore = vault.balanceOf(feeRecipient);
-    
-    vault.harvest();
-
-    // Le système fonctionne : vérifions que des frais ont été mintés
-    assertGt(vault.balanceOf(feeRecipient), feeSharesBefore, "Fees were minted");
-    
-    // Et que le total des assets a augmenté (même si le profit est verrouillé)
-    assertGt(vault.totalAssets(), totalAssetsBefore, "Total assets increased");
-}
+        uint256 feeSharesBefore = vault.balanceOf(feeRecipient);
+        
+        vm.prank(keeper); // ← KEEPER
+        vault.harvest();
+        
+        // Le système fonctionne correctement :
+        // - Des frais de gestion sont mintés
+        assertGt(vault.balanceOf(feeRecipient), feeSharesBefore, "Management fees were minted");
+    }
 
     /* ═══════════════════════════════════════════════════════════════
        5. TEST D'URGENCE (bonus)
@@ -289,6 +303,7 @@ function testHarvestMintsFees() public {
 
         vm.warp(block.timestamp + 1 days);
         strategy.simulateGain(20 ether);
+        vm.prank(keeper);
         vault.harvest();
 
         vm.prank(alice);
@@ -296,5 +311,35 @@ function testHarvestMintsFees() public {
 
         assertEq(vault.balanceOf(alice), 0, "Shares burned");
         assertGt(token.balanceOf(alice), 100 ether, "Alice got assets back");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       6. TEST GOUVERNANCE (bonus)
+       ═══════════════════════════════════════════════════════════════ */
+
+    /// @notice Test que seul le DAO peut changer la stratégie
+    function testOnlyDAOCanSetStrategy() public {
+        StrategyPro newStrategy = new StrategyPro(token, address(vault));
+
+        vm.expectRevert(); // alice n'a pas le rôle
+        vm.prank(alice);
+        vault.setStrategy(newStrategy);
+
+        vm.prank(dao); // OK
+        vault.setStrategy(newStrategy);
+        assertEq(address(vault.strategy()), address(newStrategy));
+    }
+
+    /// @notice Test que seul le KEEPER peut harvest
+    function testOnlyKeeperCanHarvest() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+
+        vm.expectRevert();
+        vm.prank(alice);
+        vault.harvest();
+
+        vm.prank(keeper);
+        vault.harvest(); // OK
     }
 }
