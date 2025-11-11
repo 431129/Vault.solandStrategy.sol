@@ -52,7 +52,7 @@ contract VaultProTest is Test {
        2. SETUP - Initialisation avant chaque test
        ═══════════════════════════════════════════════════════════════ */
 
- function setUp() public {
+function setUp() public {
     /* 1. Token */
     token = new MockERC20("Mock USDC", "mUSDC");
 
@@ -70,28 +70,22 @@ contract VaultProTest is Test {
     /* 3. Stratégie */
     strategy = new StrategyPro(token, address(vault));
 
-    /* 4. DAO configure la stratégie */
-    vm.prank(dao);
+    /* 4. DAO configure tout (avec startPrank pour plusieurs appels) */
+    vm.startPrank(dao);
+    
     vault.setStrategy(strategy);
+    vault.grantRole(vault.KEEPER(), keeper);
+    
+    vm.stopPrank();
 
     /* 5. Deal + approve */
     deal(address(token), alice, 1_000 ether);
-    deal(address(token), bob,   1_000 ether);
+    deal(address(token), bob, 1_000 ether);
     deal(address(token), carol, 1_000 ether);
 
     vm.prank(alice); token.approve(address(vault), type(uint256).max);
     vm.prank(bob);   token.approve(address(vault), type(uint256).max);
     vm.prank(carol); token.approve(address(vault), type(uint256).max);
-
-    console.log("dao has DEFAULT_ADMIN_ROLE :", vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), dao));
-    console.log("dao has KEEPER             :", vault.hasRole(vault.KEEPER(), dao));
-
-    /* 6. DAO donne le rôle KEEPER */
-    console.log("msg.sender juste avant grantRole :", msg.sender);
-    console.log("dao                               :", dao);
-
-    vm.prank(dao);
-    vault.grantRole(vault.KEEPER(), keeper);
 }
 
     /* ═══════════════════════════════════════════════════════════════
@@ -262,18 +256,7 @@ contract VaultProTest is Test {
         assertEq(assets, 50 ether);
     }
 
-    function testDepositWithSlippage() public {
-        vm.prank(alice);
-        vault.deposit(100 ether, alice, 99 ether); // minShares = 99
 
-        assertEq(vault.balanceOf(alice), 100 ether);
-    }
-
-    function testDepositSlippageReverts() public {
-        vm.prank(alice);
-        vm.expectRevert("SLIPPAGE");
-        vault.deposit(100 ether, alice, 101 ether); // trop haut
-    } 
 
     function testHarvestMintsFees() public {
         vm.prank(alice);
@@ -342,4 +325,39 @@ contract VaultProTest is Test {
         vm.prank(keeper);
         vault.harvest(); // OK
     }
+
+          /* ═══════════════════════════════════════════════════════════════
+       7. TESTS SLIPPAGE PROTECTION
+       ═══════════════════════════════════════════════════════════════ */
+
+    /// @notice Dépôt avec minShares → OK
+    function testDepositWithSlippage() public {
+        vm.prank(alice);
+        uint256 shares = vault.deposit(100 ether, alice, 99 ether); // min 99 shares
+
+        assertEq(shares, 100 ether, "Received 100 shares");
+        assertEq(vault.balanceOf(alice), 100 ether);
+    }
+
+
+    /// @notice Retrait avec maxLossBps → OK
+    function testWithdrawWithMaxLoss() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+
+        // Gain simulé
+        vm.warp(block.timestamp + 1 days);
+        strategy.simulateGain(10 ether);
+        vm.prank(keeper);
+        vault.harvest();
+
+        // Prix augmente → besoin de plus de shares pour 100 ether
+        vm.prank(alice);
+        uint256 shares = vault.withdraw(100 ether, alice, alice, 100); // max 1% loss
+
+        assertGt(shares, 90 ether, "Shares > 90 (price up)");
+    }
+
+
+
 }

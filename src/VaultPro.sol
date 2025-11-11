@@ -467,21 +467,68 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard { // ← AccessCont
         }
     }
 
+ 
+    
     /* ═══════════════════════════════════════════════════════════════
-       14. HOOKS ERC4626 (public, sans nonReentrant)
+       14. HOOKS ERC4626 (avec SLIPPAGE PROTECTION)
        ═══════════════════════════════════════════════════════════════ */
     
+    /// @notice Dépôt avec protection contre le slippage
+    /// @param assets Montant à déposer
+    /// @param receiver Destinataire des shares
+    /// @param minShares Minimum de shares à recevoir (anti-sandwich)
+    /// @return shares Mintés
     function deposit(uint256 assets, address receiver, uint256 minShares)
         public
         whenNotPaused
         returns (uint256 shares)
     {
+        // 1. CALCUL DES SHARES ATTENDUS
         shares = previewDeposit(assets);
-        require(shares >= minShares, "SLIPPAGE");
+
+        // 2. PROTECTION SLIPPAGE
+        //    → Si prix chute entre preview et tx → revert
+        require(shares >= minShares, "SLIPPAGE: too few shares");
+
+        // 3. ACCRUE FRAIS + DÉPÔT
         _accrueManagementFee();
         return super.deposit(assets, receiver);
     }
 
+    /// @notice Retrait avec protection contre la perte
+    /// @param assets Montant à retirer
+    /// @param receiver Destinataire
+    /// @param owner Propriétaire des shares
+    /// @param maxLossBps Perte max en bps (ex: 50 = 0.5%)
+    /// @return shares Brûlés
+function withdraw(uint256 assets, address receiver, address owner, uint256 maxLossBps)
+    public
+    whenNotPaused
+    returns (uint256 shares)
+{
+    // 1. CALCUL ATTENDU AVANT DÉVERROUILLAGE (SANS lockedProfit)
+    uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
+        (address(strategy) != address(0) ? strategy.currentBalance() : 0);
+    uint256 totalBefore = totalRaw > lockedProfit ? totalRaw - lockedProfit : 0;
+    uint256 supply = totalSupply();
+    uint256 expectedShares = supply == 0 ? 0 : (assets * supply) / totalBefore;
+
+    // 2. DÉVERROUILLAGE + ACCRUE
+    _unlockProfit();
+    _accrueManagementFee();
+
+    // 3. CALCUL RÉEL APRÈS MISE À JOUR
+    shares = previewWithdraw(assets);
+
+    // 4. PROTECTION SLIPPAGE
+    if (shares > expectedShares) {
+        uint256 lossBps = ((shares - expectedShares) * 10_000) / expectedShares;
+        require(lossBps <= maxLossBps, "SLIPPAGE: loss too high");
+    }
+
+    // 5. RETRAIT
+    return super.withdraw(assets, receiver, owner);
+}
     function mint(uint256 shares, address receiver)
         public
         override
@@ -492,23 +539,13 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard { // ← AccessCont
         return super.mint(shares, receiver);
     }
 
-    function withdraw(uint256 assets, address receiver, address owner, uint256 maxLossBps)
-        public
-        whenNotPaused
-        returns (uint256 shares)
-    {
-        shares = previewWithdraw(assets);
-        uint256 expected = convertToShares(assets);
-        require(expected <= shares + (shares * maxLossBps / 10_000), "Loss too high");
-        return super.withdraw(assets, receiver, owner);
-    }
-
     function redeem(uint256 shares, address receiver, address owner)
         public
         override
         whenNotPaused
         returns (uint256)
     {
+        _accrueManagementFee();
         return super.redeem(shares, receiver, owner);
     }
 }
