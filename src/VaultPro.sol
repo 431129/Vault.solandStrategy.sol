@@ -25,6 +25,7 @@ import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/ERC4626.sol";
 import "openzeppelin-contracts/contracts/access/AccessControl.sol";
 import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 import "./IStrategy.sol";
 
@@ -262,63 +263,77 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     12. RETRAIT — Entre dans la QUEUE FIFO
     ═══════════════════════════════════════════════════════════════ */
 
-    /// @notice Bloque le retrait direct ERC4626
+    /// @notice Laisse passer le retrait interne (nécessaire pour redeem() et withdraw() queue)
     function _withdraw(
-        address /*caller*/,
-        address /*receiver*/,
-        address /*owner*/,
-        uint256 /*assets*/,
-        uint256 /*shares*/
-    ) internal pure override {
-        revert("Use withdraw() with queue"); // → Force l'utilisation de la queue
-    }
-
-    /// @notice Retrait → entre dans la file d'attente
-    function withdraw(
-        uint256 assets,
+        address caller,
         address receiver,
         address owner,
-        uint256 maxLossBps
-    ) public returns (uint256 shares) {
-        shares = previewWithdraw(assets);
+        uint256 assets,
+        uint256 shares
+    ) internal override {
+        require(!paused, "Vault is paused");
+        _unlockProfit();
+        _accrueManagementFee();
 
-        // === SLIPPAGE PROTECTION ===
-        uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
-            (address(strategy) != address(0) ? strategy.currentBalance() : 0);
-        uint256 totalBefore = totalRaw > lockedProfit ? totalRaw - lockedProfit : 0;
-        uint256 supply = totalSupply();
-        uint256 expectedShares = supply == 0 ? 0 : (assets * supply) / totalBefore;
-
-        if (shares > expectedShares && expectedShares > 0) {
-            uint256 lossBps = ((shares - expectedShares) * 10_000) / expectedShares;
-            require(lossBps <= maxLossBps, "SLIPPAGE: loss too high");
-        }
-
-        // === BURN SHARES IMMEDIATELY ===
-        if (msg.sender != owner) {
-            uint256 allowed = allowance(owner, msg.sender);
-            if (allowed != type(uint256).max) {
-                _approve(owner, msg.sender, allowed - shares);
-            }
-        }
-        _burn(owner, shares);
-
-        // === ENQUEUE ===
-        withdrawQueue.push(WithdrawRequest({
-            user: receiver,
-            shares: shares,
-            assetsRequested: assets,
-            timestamp: block.timestamp
-        }));
-
-        emit WithdrawRequested(receiver, shares, assets, withdrawQueue.length - 1);
-        return shares;
+        // Retire de la stratégie si besoin
+        uint256 vaultBal = IERC20(asset()).balanceOf(address(this));
+        if (vaultBal < assets && address(strategy) != address(0)) {
+            uint256 needed = assets - vaultBal;
+            try strategy.withdraw(needed) {} catch { revert StrategyCallFailed(); }
     }
+
+    super._withdraw(caller, receiver, owner, assets, shares);
+}
+
+function withdraw(
+    uint256 assets,
+    address receiver,
+    address owner,
+    uint256 maxLossBps
+) public returns (uint256 shares) {
+    require(assets > 0, "Zero assets");
+
+    uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
+        (address(strategy) != address(0) ? strategy.currentBalance() : 0);
+
+    if (totalSupply() == 0) {
+        shares = assets;
+    } else {
+        shares = (assets * totalSupply()) / totalRaw;
+    }
+
+    // Slippage protection (compare au prix sans lockedProfit)
+    if (totalRaw > lockedProfit && maxLossBps < type(uint256).max) {
+        uint256 fairShares = (assets * totalSupply()) / (totalRaw - lockedProfit);
+        if (shares > fairShares) {
+            uint256 lossBps = ((shares - fairShares) * 10_000) / fairShares;
+            require(lossBps <= maxLossBps, "SLIPPAGE: too many shares");
+        }
+    }
+
+    if (msg.sender != owner) {
+        uint256 allowed = allowance(owner, msg.sender);
+        if (allowed != type(uint256).max) {
+            _approve(owner, msg.sender, allowed - shares);
+        }
+    }
+
+    _burn(owner, shares);
+
+    withdrawQueue.push(WithdrawRequest({
+        user: receiver,
+        shares: shares,
+        assetsRequested: assets,
+        timestamp: block.timestamp
+    }));
+
+    emit WithdrawRequested(receiver, shares, assets, withdrawQueue.length - 1);
+    return shares;
+}
 
     /* ═══════════════════════════════════════════════════════════════
        13. HARVEST — Récolte + Auto-Process Queue
        ═══════════════════════════════════════════════════════════════ */
-
     function harvest() external onlyRole(KEEPER) nonReentrant returns (uint256 profit, uint256 loss) {
         if (address(strategy) == address(0)) revert NoStrategy();
         _unlockProfit();
@@ -349,14 +364,28 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
         if (assetsAfter > assetsBefore) profit = assetsAfter - assetsBefore;
         else if (assetsAfter < assetsBefore) loss = assetsBefore - assetsAfter;
 
-        // === FRAIS DE PERFORMANCE ===
+        // === FRAIS DE PERFORMANCE – VERSION SAFE (Yearn-style, zero overflow) ===
         uint256 perfFeeAssets = 0;
         uint256 perfFeeShares = 0;
         if (profit > 0 && performanceFeeBps > 0) {
             perfFeeAssets = (profit * performanceFeeBps) / MAX_BPS;
-            uint256 price = (assetsAfter * 1e18) / totalSupply();
-            perfFeeShares = (perfFeeAssets * 1e18) / price;
-            if (perfFeeShares > 0) _mint(feeRecipient, perfFeeShares);
+
+            if (perfFeeAssets > 0 && supply > 0) {
+                // Formule officielle Yearn V3 : shares = fee_assets * totalSupply / (total_assets_after - fee_assets)
+                uint256 assetsAfterFees = assetsAfter > perfFeeAssets ? assetsAfter - perfFeeAssets : 0;
+
+                if (assetsAfterFees > 0) {
+                    perfFeeShares = Math.mulDiv(perfFeeAssets, supply, assetsAfterFees);
+                } else {
+                    // Cas extrême : tout est fee → 1:1
+                    perfFeeShares = perfFeeAssets;
+                }
+
+                if (perfFeeShares > 0) {
+                    _mint(feeRecipient, perfFeeShares);
+                }
+            }
+
             uint256 remainingProfit = profit - perfFeeAssets;
             if (remainingProfit > 0) {
                 lockedProfit += remainingProfit;
@@ -366,7 +395,7 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
 
         lastHarvestTimestamp = block.timestamp;
 
-        // === AUTO-PROCESS QUEUE (CRITICAL FIX) ===
+        // === AUTO-PROCESS QUEUE ===
         if (withdrawQueue.length > queueProcessedUntil) {
             _processWithdrawQueueInternal(10);
         }
@@ -514,12 +543,45 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
         return super.mint(shares, receiver);
     }
 
-    function redeem(uint256 shares, address receiver, address owner)
-        public
-        override
-        returns (uint256)
-    {
-        _accrueManagementFee();
-        return super.redeem(shares, receiver, owner);
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public override returns (uint256 assets) {
+        require(shares > 0, "Zero shares");
+        require(shares <= balanceOf(owner), "Insufficient balance");
+
+        if (msg.sender != owner) {
+            uint256 allowed = allowance(owner, msg.sender);
+            if (allowed != type(uint256).max) {
+                _approve(owner, msg.sender, allowed - shares);
+            }
+        }
+
+        // === PRIX JUSTE : on inclut TOUT (même les profits lockés) ===
+        uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
+            (address(strategy) != address(0) ? strategy.currentBalance() : 0);
+
+        // Si le vault est vide, 1:1
+        if (totalSupply() == 0) {
+            assets = shares;
+        } else {
+            assets = (shares * totalRaw) / totalSupply();
+        }
+
+        // === BURN IMMÉDIATEMENT (avant la queue) ===
+        _burn(owner, shares);
+
+        // === ENQUEUE ===
+        withdrawQueue.push(WithdrawRequest({
+            user: receiver,
+            shares: shares,
+            assetsRequested: assets,
+            timestamp: block.timestamp
+        }));
+
+        emit WithdrawRequested(receiver, shares, assets, withdrawQueue.length - 1);
+        return assets;
     }
+
 }
