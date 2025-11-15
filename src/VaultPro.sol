@@ -299,12 +299,12 @@ function withdraw(
     if (totalSupply() == 0) {
         shares = assets;
     } else {
-        shares = (assets * totalSupply()) / totalRaw;
+        shares = Math.mulDiv(assets, totalSupply(), totalRaw);
     }
 
     // Slippage protection (compare au prix sans lockedProfit)
     if (totalRaw > lockedProfit && maxLossBps < type(uint256).max) {
-        uint256 fairShares = (assets * totalSupply()) / (totalRaw - lockedProfit);
+       uint256 fairShares = Math.mulDiv(assets, totalSupply(), totalRaw - lockedProfit);
         if (shares > fairShares) {
             uint256 lossBps = ((shares - fairShares) * 10_000) / fairShares;
             require(lossBps <= maxLossBps, "SLIPPAGE: too many shares");
@@ -364,26 +364,18 @@ function withdraw(
         if (assetsAfter > assetsBefore) profit = assetsAfter - assetsBefore;
         else if (assetsAfter < assetsBefore) loss = assetsBefore - assetsAfter;
 
-        // === FRAIS DE PERFORMANCE – VERSION SAFE (Yearn-style, zero overflow) ===
+          // === FRAIS DE PERFORMANCE – VERSION 100% SÛRE (Yearn V3 exact) ===
         uint256 perfFeeAssets = 0;
         uint256 perfFeeShares = 0;
         if (profit > 0 && performanceFeeBps > 0) {
-            perfFeeAssets = (profit * performanceFeeBps) / MAX_BPS;
+            perfFeeAssets = profit * performanceFeeBps / MAX_BPS;
 
-            if (perfFeeAssets > 0 && supply > 0) {
-                // Formule officielle Yearn V3 : shares = fee_assets * totalSupply / (total_assets_after - fee_assets)
-                uint256 assetsAfterFees = assetsAfter > perfFeeAssets ? assetsAfter - perfFeeAssets : 0;
+            if (perfFeeAssets > 0 && totalSupply() > 0) {
+                // Formule officielle Yearn : shares = (fee_assets * totalSupply) / (assets_after - fee_assets)
+                uint256 assetsForShares = assetsAfter > perfFeeAssets ? assetsAfter - perfFeeAssets : 1;
+                perfFeeShares = Math.mulDiv(perfFeeAssets, totalSupply(), assetsForShares);
 
-                if (assetsAfterFees > 0) {
-                    perfFeeShares = Math.mulDiv(perfFeeAssets, supply, assetsAfterFees);
-                } else {
-                    // Cas extrême : tout est fee → 1:1
-                    perfFeeShares = perfFeeAssets;
-                }
-
-                if (perfFeeShares > 0) {
-                    _mint(feeRecipient, perfFeeShares);
-                }
+                _mint(feeRecipient, perfFeeShares);
             }
 
             uint256 remainingProfit = profit - perfFeeAssets;
@@ -543,45 +535,41 @@ function withdraw(
         return super.mint(shares, receiver);
     }
 
-    function redeem(
-        uint256 shares,
-        address receiver,
-        address owner
-    ) public override returns (uint256 assets) {
-        require(shares > 0, "Zero shares");
-        require(shares <= balanceOf(owner), "Insufficient balance");
+function redeem(
+    uint256 shares,
+    address receiver,
+    address owner
+) public override returns (uint256 assets) {
+    require(shares > 0, "Zero shares");
+    require(shares <= balanceOf(owner), "Insufficient balance");
 
-        if (msg.sender != owner) {
-            uint256 allowed = allowance(owner, msg.sender);
-            if (allowed != type(uint256).max) {
-                _approve(owner, msg.sender, allowed - shares);
-            }
+    if (msg.sender != owner) {
+        uint256 allowed = allowance(owner, msg.sender);
+        if (allowed != type(uint256).max) {
+            _approve(owner, msg.sender, allowed - shares);
         }
-
-        // === PRIX JUSTE : on inclut TOUT (même les profits lockés) ===
-        uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
-            (address(strategy) != address(0) ? strategy.currentBalance() : 0);
-
-        // Si le vault est vide, 1:1
-        if (totalSupply() == 0) {
-            assets = shares;
-        } else {
-            assets = (shares * totalRaw) / totalSupply();
-        }
-
-        // === BURN IMMÉDIATEMENT (avant la queue) ===
-        _burn(owner, shares);
-
-        // === ENQUEUE ===
-        withdrawQueue.push(WithdrawRequest({
-            user: receiver,
-            shares: shares,
-            assetsRequested: assets,
-            timestamp: block.timestamp
-        }));
-
-        emit WithdrawRequested(receiver, shares, assets, withdrawQueue.length - 1);
-        return assets;
     }
+
+    uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
+        (address(strategy) != address(0) ? strategy.currentBalance() : 0);
+
+    if (totalSupply() == 0) {
+        assets = shares;
+    } else {
+        assets = Math.mulDiv(shares, totalRaw, totalSupply());
+    }
+
+    _burn(owner, shares);
+
+    withdrawQueue.push(WithdrawRequest({
+        user: receiver,
+        shares: shares,
+        assetsRequested: assets,
+        timestamp: block.timestamp
+    }));
+
+    emit WithdrawRequested(receiver, shares, assets, withdrawQueue.length - 1);
+    return assets;
+}
 
 }

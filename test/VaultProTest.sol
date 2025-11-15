@@ -53,56 +53,37 @@ contract VaultProTest is Test {
        2. SETUP - Initialisation avant chaque test
        ═══════════════════════════════════════════════════════════════ */
 
-   function setUp() public {
-    // ──────────────────────────────────────────────────────────────
-    // 1. Token sous-jacent
-    // ──────────────────────────────────────────────────────────────
+  function setUp() public {
     token = new MockERC20("Mock USDC", "mUSDC");
 
-    // ──────────────────────────────────────────────────────────────
-    // 2. Vault (créé avant la stratégie)
-    // ──────────────────────────────────────────────────────────────
     vault = new VaultPro(
         IERC20(address(token)),
         "Pro Vault USDC",
         "pvUSDC",
         feeRecipient,
-        perfBps,   // 200 = 2%
-        mgmtBps,   // 100 = 1%
+        perfBps,
+        mgmtBps,
         dao
     );
 
-    // ──────────────────────────────────────────────────────────────
-    // 3. Stratégie (le constructor prend maintenant le vault)
-    // ──────────────────────────────────────────────────────────────
-    // → Modifie ton StrategyPro.sol pour avoir ce constructor :
-    // constructor(IERC20 _asset, address _vault) { asset = _asset; vault = _vault; }
     strategy = new StrategyPro(token, address(vault));
 
-    // ──────────────────────────────────────────────────────────────
-    // 4. DAO donne tous les rôles nécessaires
-    // ──────────────────────────────────────────────────────────────
     vm.startPrank(dao);
-
-    vault.grantRole(vault.KEEPER(), keeper);
-    vault.grantRole(vault.KEEPER(), address(this));     // pour appeler harvest() dans les tests
+    vault.grantRole(vault.KEEPER(), keeper);           // ← AJOUTÉ
+    vault.grantRole(vault.KEEPER(), address(this));    // ← pour les tests
     vault.grantRole(vault.STRATEGIST(), address(this));
     vault.grantRole(vault.GUARDIAN(), guardian);
-
-    // La stratégie est valide → on la set
     vault.setStrategy(strategy);
-
     vm.stopPrank();
 
-        /* 5. Deal + approve */
-        deal(address(token), alice, 1_000 ether);
-        deal(address(token), bob, 1_000 ether);
-        deal(address(token), carol, 1_000 ether);
+    deal(address(token), alice, 1_000 ether);
+    deal(address(token), bob,   1_000 ether);
+    deal(address(token), carol, 1_000 ether);
 
-        vm.prank(alice); token.approve(address(vault), type(uint256).max);
-        vm.prank(bob);   token.approve(address(vault), type(uint256).max);
-        vm.prank(carol); token.approve(address(vault), type(uint256).max);
-    }
+    vm.prank(alice); token.approve(address(vault), type(uint256).max);
+    vm.prank(bob);   token.approve(address(vault), type(uint256).max);
+    vm.prank(carol); token.approve(address(vault), type(uint256).max);
+}
 
     /* ═══════════════════════════════════════════════════════════════
        3. TEST PRINCIPAL - Cycle complet multi-user
@@ -123,48 +104,43 @@ function testMultiUserDepositHarvestWithdraw() public {
     vm.prank(keeper); vault.harvest();
 
     // === SNAPSHOT AVANT RETRAITS ===
-    uint256 feeSharesBefore = vault.balanceOf(feeRecipient);
     uint256 totalAssetsBefore = vault.totalAssets();
     uint256 totalSupplyBefore = vault.totalSupply();
+    
+    // IMPORTANT : Capturer les shares de chaque utilisateur
+    uint256 aliceShares = vault.balanceOf(alice);
+    uint256 bobShares = vault.balanceOf(bob);
+    uint256 carolShares = vault.balanceOf(carol);
+    uint256 feeShares = vault.balanceOf(feeRecipient);
 
     // === RETRAITS UTILISATEURS ===
-    vm.prank(alice); vault.redeem(vault.balanceOf(alice), alice, alice);
-    vm.prank(bob);   vault.redeem(vault.balanceOf(bob),   bob,   bob);
-    vm.prank(carol); vault.redeem(vault.balanceOf(carol), carol, carol);
+    vm.prank(alice); vault.redeem(aliceShares, alice, alice);
+    vm.prank(bob);   vault.redeem(bobShares, bob, bob);
+    vm.prank(carol); vault.redeem(carolShares, carol, carol);
+    
+    // Retrait des frais aussi
+    if (feeShares > 0) {
+        vm.prank(feeRecipient); 
+        vault.redeem(feeShares, feeRecipient, feeRecipient);
+    }
 
-    // === ON DONNE TOUT L'ARGENT NÉCESSAIRE (dépôts + gains) ===
-    deal(address(token), address(vault), 455 ether);
+    // === FORCER LE RETRAIT DE LA STRATÉGIE ===
+    // La stratégie doit rendre tout son argent au vault
+    vm.prank(address(vault));
+    strategy.withdraw(token.balanceOf(address(strategy)));
 
-    // === TRAITE TOUTE LA QUEUE UTILISATEURS ===
+    // === TRAITE TOUTE LA QUEUE ===
     vm.prank(keeper);
     vault.processWithdrawQueue(type(uint256).max);
 
-    // === RETRAIT DES FRAIS (utilise le snapshot d'avant) ===
-    uint256 feeShares = vault.balanceOf(feeRecipient);
-    if (feeShares > 0 && totalSupplyBefore > 0) {
-        // Calcul basé sur le ratio AVANT les retraits
-        uint256 feeAssets = (feeShares * totalAssetsBefore) / totalSupplyBefore;
-        
-        // S'assurer qu'on a assez de tokens
-        uint256 currentAssets = vault.totalAssets();
-        if (feeAssets > currentAssets) {
-            deal(address(token), address(vault), feeAssets);
-        }
-
-        vm.prank(feeRecipient);
-        vault.redeem(feeShares, feeRecipient, feeRecipient);
-
-        vm.prank(keeper);
-        vault.processWithdrawQueue(type(uint256).max);
-    }
-
     // === ASSERTIONS FINALES ===
-    assertApproxEqAbs(vault.totalAssets(), 0, 1e15, "Vault vide a la dust pres");
+    assertApproxEqAbs(vault.totalAssets(), 0, 1e15, "Vault vide a la dust pres"); 
     assertEq(vault.totalSupply(), 0, "Aucune share restante");
 
     uint256 totalOut = token.balanceOf(alice) + token.balanceOf(bob) + token.balanceOf(carol) + token.balanceOf(feeRecipient);
-    assertApproxEqAbs(totalOut, 455 ether, 20 ether, "Tout l'argent est bien sorti (frais inclus)");
+    assertApproxEqAbs(totalOut, totalAssetsBefore, 1e15, "Tout l'argent est bien sorti");
 }
+
 
     /* ═══════════════════════════════════════════════════════════════
        4. TESTS UNITAIRES SIMPLES
@@ -228,8 +204,7 @@ function testMultiUserDepositHarvestWithdraw() public {
         uint256 assets = vault.previewDeposit(50 ether);
         assertEq(assets, 50 ether);
     }
-
-    /// @notice Test que harvest mint des frais
+/// @notice Test que harvest mint des frais
     function testHarvestMintsFees() public {
         vm.prank(alice);
         vault.deposit(100 ether, alice);
@@ -237,7 +212,7 @@ function testMultiUserDepositHarvestWithdraw() public {
         vm.warp(block.timestamp + 1 days);
         strategy.simulateGain(100 ether);
 
-        uint256 feeSharesBefore = vault.balanceOf(feeRecipient);
+        uint256 feeSharesBefore = vault.balanceOf(feeRecipient);  // ← AJOUTEZ CETTE LIGNE
         
         vm.prank(keeper);
         vault.harvest();
