@@ -403,55 +403,58 @@ function withdraw(
 
     /// @notice Traite la file d'attente (version interne pour harvest)
     function _processWithdrawQueueInternal(uint256 maxCount) internal {
-        if (withdrawQueue.length <= queueProcessedUntil) return;
+    if (withdrawQueue.length <= queueProcessedUntil) return;
 
-        uint256 processed = 0;
-        uint256 end = withdrawQueue.length > queueProcessedUntil + maxCount
-            ? queueProcessedUntil + maxCount
-            : withdrawQueue.length;
+    uint256 processed = 0;
+    uint256 end = withdrawQueue.length > queueProcessedUntil + maxCount
+        ? queueProcessedUntil + maxCount
+        : withdrawQueue.length;
 
-        for (uint256 i = queueProcessedUntil; i < end; ++i) {
-            WithdrawRequest memory req = withdrawQueue[i];
+    for (uint256 i = queueProcessedUntil; i < end; ++i) {
+        WithdrawRequest memory req = withdrawQueue[i];
 
-            bool force = block.timestamp >= req.timestamp + MAX_QUEUE_DELAY;
-            uint256 vaultBalance = IERC20(asset()).balanceOf(address(this));
+        bool force = block.timestamp >= req.timestamp + MAX_QUEUE_DELAY;
+        uint256 vaultBalance = IERC20(asset()).balanceOf(address(this));
 
-            // === PULL FROM STRATEGY IF NEEDED ===
-            if (vaultBalance < req.assetsRequested) {
-                if (address(strategy) != address(0)) {
-                    uint256 needed = req.assetsRequested - vaultBalance;
-                    uint256 stratBalance = strategy.currentBalance();
-                    uint256 toWithdraw = needed > stratBalance ? stratBalance : needed;
-                    
-                    if (toWithdraw > 0) {
-                        try strategy.withdraw(toWithdraw) {} catch {}
-                        vaultBalance = IERC20(asset()).balanceOf(address(this));
-                    }
+        // === PULL FROM STRATEGY IF NEEDED ===
+        if (vaultBalance < req.assetsRequested) {
+            if (address(strategy) != address(0)) {
+                uint256 needed = req.assetsRequested - vaultBalance;
+                uint256 stratBalance = strategy.currentBalance();
+                uint256 toWithdraw = needed > stratBalance ? stratBalance : needed;
+                
+                if (toWithdraw > 0) {
+                    try strategy.withdraw(toWithdraw) {} catch {}
+                    vaultBalance = IERC20(asset()).balanceOf(address(this));
                 }
             }
-
-            // === CHECK IF WE CAN FULFILL ===
-            if (!force && vaultBalance < req.assetsRequested) {
-                break; // Not enough liquidity, stop processing
-            }
-
-            // === FULFILL REQUEST ===
-            uint256 toSend = req.assetsRequested;
-            if (vaultBalance < toSend) {
-                toSend = vaultBalance; // Send what we have (force case)
-            }
-
-            if (toSend > 0) {
-                IERC20(asset()).safeTransfer(req.user, toSend);
-                emit WithdrawProcessed(req.user, toSend, i);
-            }
-
-            processed++;
         }
 
-        queueProcessedUntil += processed;
-        emit QueueProcessed(processed);
+        // === CHECK IF WE CAN FULFILL ===
+        if (!force && vaultBalance < req.assetsRequested) {
+            break; // Not enough liquidity, stop processing
+        }
+
+        // === FULFILL REQUEST ===
+        uint256 toSend = req.assetsRequested;
+        if (vaultBalance < toSend) {
+            toSend = vaultBalance; // Send what we have (force case)
+        }
+
+        if (toSend > 0) {
+            IERC20(asset()).safeTransfer(req.user, toSend);
+            emit WithdrawProcessed(req.user, toSend, i);
+        }
+
+        // ✅ NOUVEAU : Brûler les shares APRÈS avoir payé
+        _burn(address(this), req.shares);
+
+        processed++;
     }
+
+    queueProcessedUntil += processed;
+    emit QueueProcessed(processed);
+}
 
     /* ═══════════════════════════════════════════════════════════════
        15. PROFIT LOCKING — Déverrouillage linéaire
@@ -476,23 +479,36 @@ function withdraw(
        16. URGENCE — Hors queue
        ═══════════════════════════════════════════════════════════════ */
 
-    function emergencyWithdraw() external nonReentrant {
-        uint256 shares = balanceOf(msg.sender);
-        if (shares == 0) return;
+function emergencyWithdraw() external nonReentrant {
+    uint256 userShares = balanceOf(msg.sender);
+    require(userShares > 0, "No shares");
 
-        uint256 assets = convertToAssets(shares);
-        _burn(msg.sender, shares);
+    // Calculer les assets
+    uint256 assets = convertToAssets(userShares);
+    
+    // Brûler les shares de l'utilisateur
+    _burn(msg.sender, userShares);
 
-        if (address(strategy) != address(0)) {
-            try strategy.withdrawAllToVault() {} catch {}
+    // Essayer de retirer de la stratégie si nécessaire
+    uint256 vaultBalance = IERC20(asset()).balanceOf(address(this));
+    if (vaultBalance < assets && address(strategy) != address(0)) {
+        uint256 needed = assets - vaultBalance;
+        uint256 stratBalance = strategy.currentBalance();
+        uint256 toWithdraw = needed > stratBalance ? stratBalance : needed;
+        
+        if (toWithdraw > 0) {
+            try strategy.withdraw(toWithdraw) {} catch {}
+            vaultBalance = IERC20(asset()).balanceOf(address(this));
         }
-
-        uint256 bal = IERC20(asset()).balanceOf(address(this));
-        uint256 toSend = bal > assets ? assets : bal;
-        if (toSend > 0) IERC20(asset()).safeTransfer(msg.sender, toSend);
-
-        emit EmergencyWithdraw(msg.sender, shares, toSend);
     }
+
+    // Envoyer ce qui est disponible
+    uint256 toSend = assets > vaultBalance ? vaultBalance : assets;
+    if (toSend > 0) {
+        IERC20(asset()).safeTransfer(msg.sender, toSend);
+    }
+
+}
 
     /* ═══════════════════════════════════════════════════════════════
        17. NETTOYAGE
@@ -550,6 +566,7 @@ function redeem(
         }
     }
 
+    // Calculer les assets AVANT tout changement de supply
     uint256 totalRaw = IERC20(asset()).balanceOf(address(this)) +
         (address(strategy) != address(0) ? strategy.currentBalance() : 0);
 
@@ -559,7 +576,11 @@ function redeem(
         assets = Math.mulDiv(shares, totalRaw, totalSupply());
     }
 
-    _burn(owner, shares);
+    // ✅ CHANGEMENT : Transférer au vault au lieu de brûler
+    _transfer(owner, address(this), shares);
+    
+    // ❌ ANCIEN CODE :
+    // _burn(owner, shares);
 
     withdrawQueue.push(WithdrawRequest({
         user: receiver,
