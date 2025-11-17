@@ -317,8 +317,8 @@ function withdraw(
             _approve(owner, msg.sender, allowed - shares);
         }
     }
-
-    _burn(owner, shares);
+    _transfer(owner, address(this), shares);
+    //_burn(owner, shares);
 
     withdrawQueue.push(WithdrawRequest({
         user: receiver,
