@@ -27,7 +27,7 @@ import "openzeppelin-contracts/contracts/access/AccessControl.sol";
 import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
-import "./IStrategy.sol";
+import "./interfaces/IStrategy.sol";
 
 contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -115,6 +115,7 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     event WithdrawRequested(address indexed user, uint256 shares, uint256 assets, uint256 index);
     event WithdrawProcessed(address indexed user, uint256 assets, uint256 index);
     event QueueProcessed(uint256 count);
+    event StrategyChanged(address indexed newStrategy);
 
     /* ═══════════════════════════════════════════════════════════════
        6. ERRORS (gas efficient)
@@ -161,11 +162,11 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
        ═══════════════════════════════════════════════════════════════ */
 
     /// @notice Change la stratégie (seul STRATEGIST)
-    function setStrategy(IStrategy _strategy) external onlyRole(STRATEGIST) {
-        if (address(_strategy) == address(0)) revert ZeroAddress();
-        emit StrategyMigrated(address(strategy), address(_strategy));
-        strategy = _strategy;
-    }
+   function setStrategy(IStrategy newStrategy) external onlyRole(STRATEGIST) {
+    require(address(newStrategy) != address(0), "Zero strategy");
+    strategy = newStrategy;
+    emit StrategyChanged(address(newStrategy));
+}
 
     /// @notice Met à jour les frais (seul ADMIN)
     function setFees(uint256 _perfBps, uint256 _mgmtBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -334,67 +335,75 @@ function withdraw(
     /* ═══════════════════════════════════════════════════════════════
        13. HARVEST — Récolte + Auto-Process Queue
        ═══════════════════════════════════════════════════════════════ */
-    function harvest() external onlyRole(KEEPER) nonReentrant returns (uint256 profit, uint256 loss) {
-        if (address(strategy) == address(0)) revert NoStrategy();
-        _unlockProfit();
+   function harvest() external onlyRole(KEEPER) nonReentrant returns (uint256 profit, uint256 loss) {
+    if (address(strategy) == address(0)) revert NoStrategy();
+    _unlockProfit();
 
-        // === AVANT ===
-        uint256 vaultBalBefore = IERC20(asset()).balanceOf(address(this));
-        uint256 stratBalBefore = address(strategy) != address(0) ? strategy.currentBalance() : 0;
-        uint256 assetsBefore = vaultBalBefore + stratBalBefore - lockedProfit;
-        uint256 supply = totalSupply();
-
-        if (supply == 0) {
-            lastHarvestTimestamp = block.timestamp;
-            lastReport = block.timestamp;
-            return (0, 0);
-        }
-
-        _accrueManagementFee();
-
-        // === STRATÉGIE HARVEST ===
-        try strategy.harvest() returns (uint256) {} catch {}
-
-        // === APRÈS ===
-        uint256 vaultBalAfter = IERC20(asset()).balanceOf(address(this));
-        uint256 stratBalAfter = address(strategy) != address(0) ? strategy.currentBalance() : 0;
-        uint256 assetsAfter = vaultBalAfter + stratBalAfter - lockedProfit;
-
-        // === PROFIT / LOSS ===
-        if (assetsAfter > assetsBefore) profit = assetsAfter - assetsBefore;
-        else if (assetsAfter < assetsBefore) loss = assetsBefore - assetsAfter;
-
-          // === FRAIS DE PERFORMANCE – VERSION 100% SÛRE (Yearn V3 exact) ===
-        uint256 perfFeeAssets = 0;
-        uint256 perfFeeShares = 0;
-        if (profit > 0 && performanceFeeBps > 0) {
-            perfFeeAssets = profit * performanceFeeBps / MAX_BPS;
-
-            if (perfFeeAssets > 0 && totalSupply() > 0) {
-                // Formule officielle Yearn : shares = (fee_assets * totalSupply) / (assets_after - fee_assets)
-                uint256 assetsForShares = assetsAfter > perfFeeAssets ? assetsAfter - perfFeeAssets : 1;
-                perfFeeShares = Math.mulDiv(perfFeeAssets, totalSupply(), assetsForShares);
-
-                _mint(feeRecipient, perfFeeShares);
-            }
-
-            uint256 remainingProfit = profit - perfFeeAssets;
-            if (remainingProfit > 0) {
-                lockedProfit += remainingProfit;
-                lastReport = block.timestamp;
-            }
-        }
-
+    uint256 supply = totalSupply();
+    if (supply == 0) {
         lastHarvestTimestamp = block.timestamp;
+        lastReport = block.timestamp;
+        return (0, 0);
+    }
 
-        // === AUTO-PROCESS QUEUE ===
-        if (withdrawQueue.length > queueProcessedUntil) {
-            _processWithdrawQueueInternal(10);
+    _accrueManagementFee();
+
+    // === LIRE BALANCE AVANT (mais après avoir appelé harvest de la stratégie) ===
+    // uint256 vaultBalBefore = IERC20(asset()).balanceOf(address(this));
+    // uint256 stratBalBefore = address(strategy) != address(0) ? strategy.currentBalance() : 0;
+    
+    // === APPELER STRATEGY HARVEST QUI RETOURNE LE PROFIT ===
+    uint256 stratProfit;
+    uint256 stratLoss;
+    try strategy.harvest() returns (uint256 p, uint256 l) {
+        stratProfit = p;
+        stratLoss = l;
+    } catch {
+        stratProfit = 0;
+        stratLoss = 0;
+    }
+
+    // === UTILISER LE PROFIT RETOURNÉ PAR LA STRATÉGIE ===
+    if (stratProfit > stratLoss) {
+        profit = stratProfit - stratLoss;
+    } else if (stratLoss > stratProfit) {
+        loss = stratLoss - stratProfit;
+    }
+
+    // === CALCULER assetsAfter pour validation ===
+    uint256 vaultBalAfter = IERC20(asset()).balanceOf(address(this));
+    uint256 stratBalAfter = address(strategy) != address(0) ? strategy.currentBalance() : 0;
+    uint256 assetsAfter = vaultBalAfter + stratBalAfter;
+
+    // === FRAIS DE PERFORMANCE ===
+    uint256 perfFeeAssets = 0;
+    uint256 perfFeeShares = 0;
+    if (profit > 0 && performanceFeeBps > 0) {
+        perfFeeAssets = profit * performanceFeeBps / MAX_BPS;
+
+        if (perfFeeAssets > 0 && totalSupply() > 0) {
+            uint256 assetsForShares = assetsAfter > perfFeeAssets ? assetsAfter - perfFeeAssets : 1;
+            perfFeeShares = Math.mulDiv(perfFeeAssets, totalSupply(), assetsForShares);
+            _mint(feeRecipient, perfFeeShares);
         }
 
-        emit Harvested(profit, loss, perfFeeAssets, 0, perfFeeShares);
-        return (profit, loss);
+        uint256 remainingProfit = profit - perfFeeAssets;
+        if (remainingProfit > 0) {
+            lockedProfit += remainingProfit;
+            lastReport = block.timestamp;
+        }
     }
+
+    lastHarvestTimestamp = block.timestamp;
+
+    // === AUTO-PROCESS QUEUE ===
+    if (withdrawQueue.length > queueProcessedUntil) {
+        _processWithdrawQueueInternal(10);
+    }
+
+    emit Harvested(profit, loss, perfFeeAssets, 0, perfFeeShares);
+    return (profit, loss);
+}
 
     /// @notice Traite la file d'attente (version publique)
     function processWithdrawQueue(uint256 maxCount) public onlyRole(KEEPER) {
@@ -508,6 +517,41 @@ function emergencyWithdraw() external nonReentrant {
         IERC20(asset()).safeTransfer(msg.sender, toSend);
     }
 
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   19. RAGE QUIT – Retrait immédiat hors queue (paye une pénalité)
+   ═══════════════════════════════════════════════════════════════ */
+uint256 public constant RAGE_QUIT_FEE_BPS = 50; // 0.5% pénalité → va au vault (anti-abus)
+event RageQuit(address indexed user, uint256 shares, uint256 assetsReceived, uint256 feePaid);
+
+/// @notice Permet de sortir IMMÉDIATEMENT, même si pas de liquidité
+/// @dev Brûle les shares, retire tout de la stratégie si besoin, paye 0.5% de pénalité
+function rageQuit() external nonReentrant {
+    uint256 shares = balanceOf(msg.sender);
+    require(shares > 0, "No shares");
+
+    // 1. On calcule combien l'utilisateur mérite sans locked profit (fair price)
+    uint256 fairAssets = convertToAssets(shares);
+
+    // 2. On force le retrait complet de la stratégie vers le vault
+    if (address(strategy) != address(0)) {
+        try strategy.withdrawAllToVault() {} catch {}
+    }
+
+    // 3. On calcule la pénalité (0.5%)
+    uint256 fee = fairAssets * RAGE_QUIT_FEE_BPS / MAX_BPS;
+    uint256 assetsToSend = fairAssets > fee ? fairAssets - fee : 0;
+
+    // 4. On brûle les shares + envoi
+    _burn(msg.sender, shares);
+
+    if (assetsToSend > 0) {
+        IERC20(asset()).safeTransfer(msg.sender, assetsToSend);
+    }
+
+    // Le fee reste dans le vault → profite aux autres LPs (anti-abus + incitation à rester)
+    emit RageQuit(msg.sender, shares, assetsToSend, fee);
 }
 
     /* ═══════════════════════════════════════════════════════════════

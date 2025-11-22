@@ -7,10 +7,10 @@ interface IStrategy {
     function invest(uint256 amount) external;
 
     /// @notice Récolte les profits
-    function harvest() external returns (uint256 profit);
+    function harvest() external returns (uint256 profit, uint256 loss);
 
     /// @notice Retire un montant
-    function withdraw(uint256 amount) external;
+    function withdraw(uint256 amount) external returns (uint256);
 
     /// @notice Vide tout vers le vault
     function withdrawAllToVault() external;
