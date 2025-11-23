@@ -28,8 +28,9 @@ import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 import "./interfaces/IStrategy.sol";
+import "./CircuitBreaker.sol";
 
-contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
+contract VaultPro is ERC4626, AccessControl, ReentrancyGuard, CircuitBreaker {
     using SafeERC20 for IERC20;
 
     /* ═══════════════════════════════════════════════════════════════
@@ -51,6 +52,14 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     uint256 public lastMgmtAccrual;               // Dernier accrual des frais de gestion
     uint256 public depositCap;                    // Cap de dépôt total
     bool public paused;                           // État de pause
+    address public timeLock;                      // Adresse du contrat TimeLock
+    bool public timeLockEnabled;                  // Active/désactive le système timelock
+
+    /* ═══════════════════════════════════════════════════════════════
+        Mapping
+       ═══════════════════════════════════════════════════════════════ */
+    // Mapping des délais requis par fonction
+    mapping(bytes4 => uint256) public requiredDelay;
 
     /* ═══════════════════════════════════════════════════════════════
        3. PROFIT LOCKING (6h) — Anti-sandwich
@@ -100,6 +109,8 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
         return type(uint256).max;
     }
 
+ 
+
     /* ═══════════════════════════════════════════════════════════════
        5. EVENTS (pour frontend + indexation)
        ═══════════════════════════════════════════════════════════════ */
@@ -116,6 +127,10 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     event WithdrawProcessed(address indexed user, uint256 assets, uint256 index);
     event QueueProcessed(uint256 count);
     event StrategyChanged(address indexed newStrategy);
+    event TimeLockSet(address indexed timeLock);
+    event TimeLockToggled(bool enabled);
+    event DelayConfigured(bytes4 indexed selector, uint256 delay);
+
 
     /* ═══════════════════════════════════════════════════════════════
        6. ERRORS (gas efficient)
@@ -126,6 +141,29 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     error DepositExceedsCap(uint256 assets, uint256 cap);
     error StrategyCallFailed();
     error InsufficientLiquidity();
+
+      /* ═══════════════════════════════════════════════════════════════
+        Modifiers
+       ═══════════════════════════════════════════════════════════════ */
+
+    /**
+    * @notice Modifier intelligent qui adapte le timelock selon la fonction
+    * @dev Les fonctions critiques nécessitent toujours le timelock
+    *      Les fonctions moins critiques peuvent être appelées directement par les rôles
+    */
+    modifier withTimelock(bytes32 role) {
+        bytes4 selector = msg.sig;
+        uint256 delay = requiredDelay[selector];
+        
+        if (delay > 0 && timeLockEnabled && timeLock != address(0)) {
+            // Fonction critique → DOIT passer par le timelock
+            require(msg.sender == timeLock, "Must use TimeLock");
+        } else {
+            // Fonction non-critique → Vérifie le rôle
+            require(hasRole(role, msg.sender), "Not authorized");
+        }
+        _;
+    }
 
     /* ═══════════════════════════════════════════════════════════════
        7. CONSTRUCTEUR — Initialisation DAO
@@ -149,12 +187,71 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
         lastHarvestTimestamp = block.timestamp;
         lastMgmtAccrual = block.timestamp;
         lastReport = block.timestamp;
+        highWaterMark = 0;
 
         // DAO = admin + tous les rôles
         _grantRole(DEFAULT_ADMIN_ROLE, _dao);
         _grantRole(STRATEGIST, _dao);
         _grantRole(KEEPER, _dao);
         _grantRole(GUARDIAN, _dao);
+        //_configureTimelockDelays();// Configure les délais
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+    11. FONCTIONS TIMELOCK (configure les délais requis pour chaque fonction critique)
+    ═══════════════════════════════════════════════════════════════ */
+    
+ 
+    /**
+    * @notice Configure le TimeLock (peut être fait qu'une fois)
+    */
+    function setTimeLock(address _timeLock) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_timeLock != address(0), "Zero address");
+        require(timeLock == address(0), "Already set");
+        
+        timeLock = _timeLock;
+        timeLockEnabled = true;
+        
+        emit TimeLockSet(_timeLock);
+}
+    /**
+    * @notice Configure un délai pour une fonction spécifique
+    * @param selector Le selector de la fonction (ex: vault.setStrategy.selector)
+    * @param delay Le délai en secondes
+    */
+    function setRequiredDelay(bytes4 selector, uint256 delay) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(delay <= 7 days, "Delay too long");
+        requiredDelay[selector] = delay;
+        emit DelayConfigured(selector, delay);
+    }
+
+    /**
+    * @notice Configure tous les délais critiques en une fois
+    * @dev À appeler juste après le déploiement
+    */
+    function batchConfigureDelays() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        requiredDelay[this.setStrategy.selector] = 2 days;
+        requiredDelay[this.setFees.selector] = 2 days;
+        requiredDelay[this.setDepositCap.selector] = 2 days;
+        requiredDelay[this.setFeeRecipient.selector] = 2 days;
+        requiredDelay[this.setTimeLock.selector] = 1 days;
+        
+        emit DelayConfigured(this.setStrategy.selector, 2 days);
+        emit DelayConfigured(this.setFees.selector, 2 days);
+        emit DelayConfigured(this.setDepositCap.selector, 2 days);
+        emit DelayConfigured(this.setFeeRecipient.selector, 2 days);
+        emit DelayConfigured(this.setTimeLock.selector, 1 days);
+    }
+
+    /**
+    * @notice Active/désactive le TimeLock (emergency override)
+    */
+    function toggleTimeLock() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        timeLockEnabled = !timeLockEnabled;
+        emit TimeLockToggled(timeLockEnabled);
     }
 
     /* ═══════════════════════════════════════════════════════════════
@@ -162,14 +259,14 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
        ═══════════════════════════════════════════════════════════════ */
 
     /// @notice Change la stratégie (seul STRATEGIST)
-   function setStrategy(IStrategy newStrategy) external onlyRole(STRATEGIST) {
+   function setStrategy(IStrategy newStrategy) external withTimelock(STRATEGIST) {
     require(address(newStrategy) != address(0), "Zero strategy");
     strategy = newStrategy;
     emit StrategyChanged(address(newStrategy));
 }
 
     /// @notice Met à jour les frais (seul ADMIN)
-    function setFees(uint256 _perfBps, uint256 _mgmtBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setFees(uint256 _perfBps, uint256 _mgmtBps) external withTimelock(DEFAULT_ADMIN_ROLE)  {
         if (_perfBps > 3000 || _mgmtBps > 200) revert InvalidFee(_perfBps);
         performanceFeeBps = _perfBps;
         managementFeeBps = _mgmtBps;
@@ -177,13 +274,13 @@ contract VaultPro is ERC4626, AccessControl, ReentrancyGuard {
     }
 
     /// @notice Cap de dépôt total
-    function setDepositCap(uint256 _cap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setDepositCap(uint256 _cap) external withTimelock(DEFAULT_ADMIN_ROLE) {
         depositCap = _cap;
         emit DepositCapUpdated(_cap);
     }
 
     /// @notice Change le destinataire des frais
-    function setFeeRecipient(address _feeRecipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setFeeRecipient(address _feeRecipient) external withTimelock(DEFAULT_ADMIN_ROLE) {
         if (_feeRecipient == address(0)) revert ZeroAddress();
         feeRecipient = _feeRecipient;
     }
@@ -368,6 +465,8 @@ function withdraw(
         profit = stratProfit - stratLoss;
     } else if (stratLoss > stratProfit) {
         loss = stratLoss - stratProfit;
+
+        
     }
 
     // === CALCULER assetsAfter pour validation ===
